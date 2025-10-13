@@ -1,0 +1,5 @@
+unsloth_env/
+unsloth_compiled_cache/
+.ipynb_checkpoints/
+outputs/
+.env

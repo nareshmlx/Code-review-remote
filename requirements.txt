@@ -1,0 +1,13 @@
+transformers==4.55.4
+trl==0.22.2
+datasets>=3.4.1,<4.0.0
+huggingface_hub>=0.34.0
+sentencepiece
+protobuf
+bitsandbytes
+accelerate
+peft
+hf_transfer
+ipywidgets
+jupyter
+notebook
