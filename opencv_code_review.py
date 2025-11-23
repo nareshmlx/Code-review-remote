@@ -2,17 +2,16 @@
 """
 OpenCV Code Reviewer Fine-tuning Script
 Fine-tunes Qwen2.5-Coder-7B-Instruct for OpenCV code review tasks
+Fixed for Blackwell GPU compatibility
 """
-import unsloth  # Ensure unsloth is imported first
+import unsloth
 import os
 import re
+import sys
 import torch
 from datasets import load_dataset
 from transformers import TextStreamer, DataCollatorForSeq2Seq
 from trl import SFTConfig, SFTTrainer
-from unsloth import FastLanguageModel
-from unsloth.chat_templates import get_chat_template, standardize_sharegpt
-
 from dotenv import load_dotenv
 
 load_dotenv(override=True)
@@ -25,7 +24,7 @@ load_dotenv(override=True)
 MAX_SEQ_LENGTH = 16384  # Maximum sequence length for context
 DTYPE = None  # Auto-detect (Float16 for Tesla T4/V100, Bfloat16 for Ampere+)
 LOAD_IN_4BIT = True  # Use 4-bit quantization to reduce memory
-MODEL_NAME = "unsloth/Qwen2.5-Coder-7B-Instruct"
+MODEL_NAME = "nareshmlx/code-reviewer-opencv-16k"
 
 # LoRA Configuration
 LORA_R = 16  # LoRA rank (higher = more parameters, better fit, more memory)
@@ -37,11 +36,11 @@ TARGET_MODULES = [
 ]
 
 # Training Configuration
-PER_DEVICE_BATCH_SIZE = 1  # Keep at 1 for 16k context
-GRADIENT_ACCUMULATION_STEPS = 16  # Effective batch size = 16
+PER_DEVICE_BATCH_SIZE = 4  # Keep at 1 for 16k context
+GRADIENT_ACCUMULATION_STEPS = 8  # Effective batch size = 32
 WARMUP_STEPS = 50
-NUM_TRAIN_EPOCHS = 1
-LEARNING_RATE = 2e-4
+NUM_TRAIN_EPOCHS = 2
+LEARNING_RATE = 2.5e-4
 LOGGING_STEPS = 5
 OPTIMIZER = "paged_adamw_8bit"
 WEIGHT_DECAY = 0.01
@@ -62,6 +61,48 @@ OUTPUT_DIR = "outputs"
 RANDOM_SEED = 3407
 
 # ============================================================================
+# GPU COMPATIBILITY CHECK
+# ============================================================================
+
+def check_gpu_compatibility():
+    """Check GPU compatibility with current PyTorch installation"""
+    print("\n" + "="*70)
+    print("GPU COMPATIBILITY CHECK")
+    print("="*70)
+    
+    if not torch.cuda.is_available():
+        print("❌ ERROR: No CUDA GPU detected!")
+        print("This script requires a CUDA-capable GPU.")
+        sys.exit(1)
+    
+    gpu_name = torch.cuda.get_device_name(0)
+    gpu_capability = torch.cuda.get_device_capability(0)
+    compute_capability = f"sm_{gpu_capability[0]}{gpu_capability[1]}"
+    
+    print(f"PyTorch version: {torch.__version__}")
+    print(f"CUDA version: {torch.version.cuda}")
+    print(f"GPU: {gpu_name}")
+    print(f"Compute Capability: {compute_capability}")
+    print(f"GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.2f} GB")
+    
+    # Check if Blackwell GPU
+    if gpu_capability[0] == 12:  # Blackwell is compute capability 12.x
+        print("\n⚠️  Blackwell GPU detected!")
+        if torch.__version__ < "2.6.0":
+            print("❌ ERROR: Blackwell GPUs require PyTorch 2.6.0 or higher (nightly)")
+            print("\nTo fix this, run:")
+            print("  pip uninstall -y torch torchvision torchaudio")
+            print("  pip install --pre torch torchvision torchaudio --index-url https://download.pytorch.org/whl/nightly/cu124")
+            print("  pip uninstall -y unsloth unsloth-zoo")
+            print('  pip install --no-deps "unsloth[cu124-ampere-torch260] @ git+https://github.com/unslothai/unsloth.git"')
+            sys.exit(1)
+        else:
+            print("✓ PyTorch version is compatible with Blackwell")
+    
+    print("="*70 + "\n")
+    return True
+
+# ============================================================================
 # SETUP AND INSTALLATION
 # ============================================================================
 
@@ -69,48 +110,27 @@ def setup_environment():
     """Install required packages based on environment"""
     print("Setting up environment...")
     
+    # Check compatibility first
+    check_gpu_compatibility()
+    
     # Check if running in Colab
     is_colab = "COLAB_" in "".join(os.environ.keys())
     
     if not is_colab:
-        os.system("pip install -q unsloth")
-    else:
-        # Colab-specific installation
-        v = re.match(r"[0-9\.]{3,}", str(torch.__version__)).group(0)
-        xformers = "xformers==" + ("0.0.32.post2" if v == "2.8.0" else "0.0.29.post3")
-        os.system(f"pip install -q --no-deps bitsandbytes accelerate {xformers} peft trl triton cut_cross_entropy unsloth_zoo")
+        # Local/SSH installation
+        print("Installing packages for local/SSH environment...")
+        
+        # Install base packages
+        os.system("pip install -q accelerate peft trl triton")
         os.system('pip install -q sentencepiece protobuf "datasets>=3.4.1,<4.0.0" "huggingface_hub>=0.34.0" hf_transfer')
-        os.system("pip install -q --no-deps unsloth")
-    
-    # Install specific versions
-    os.system("pip install -q transformers==4.55.4")
-    os.system("pip install -q --no-deps trl==0.22.2")
-    
-    # Upgrade unsloth for CUDA 12.1 and Ampere GPUs
-    os.system("pip uninstall -y unsloth unsloth-zoo torchao")
-    os.system('pip install -q --upgrade --no-cache-dir "unsloth[cu121-ampere-torch250] @ git+https://github.com/unslothai/unsloth.git"')
-    
-    # Install specific torchao version
-    os.system("pip uninstall -y torchao")
-    os.system("pip install -q torchao==0.12.0")
+        
+        # Install specific versions
+        os.system("pip install -q transformers==4.55.4")
+        os.system("pip install -q --no-deps trl==0.22.2")
+        
+        print("✓ Base packages installed")
     
     print("✓ Environment setup complete!")
-
-def check_gpu():
-    """Check GPU availability and display information"""
-    print("\n" + "="*70)
-    print("GPU INFORMATION")
-    print("="*70)
-    print(f"PyTorch version: {torch.__version__}")
-    print(f"CUDA available: {torch.cuda.is_available()}")
-    
-    if torch.cuda.is_available():
-        print(f"CUDA version: {torch.version.cuda}")
-        print(f"GPU: {torch.cuda.get_device_name(0)}")
-        print(f"GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.2f} GB")
-    else:
-        print("WARNING: No GPU detected! Training will be very slow.")
-    print("="*70 + "\n")
 
 # ============================================================================
 # DATA PREPROCESSING
@@ -149,28 +169,35 @@ def prepare_dataset(tokenizer):
     print("LOADING DATASET")
     print("="*70)
     
-    # Load dataset
-    dataset = load_dataset(DATASET_NAME, split="train")
-    print(f"Loaded {len(dataset)} examples")
-    
-    # Standardize and convert format
-    dataset = standardize_sharegpt(dataset)
-    dataset = dataset.map(
-        alpaca_to_conversations,
-        batched=True,
-        remove_columns=["instruction", "input", "output"]
-    )
-    
-    # Apply chat template
-    dataset = dataset.map(
-        lambda examples: formatting_prompts_func(examples, tokenizer),
-        batched=True
-    )
-    
-    print(f"✓ Dataset prepared with {len(dataset)} examples")
-    print("="*70 + "\n")
-    
-    return dataset
+    try:
+        # Import here to avoid early import issues
+        from unsloth.chat_templates import standardize_sharegpt
+        
+        # Load dataset
+        dataset = load_dataset(DATASET_NAME, split="train")
+        print(f"Loaded {len(dataset)} examples")
+        
+        # Standardize and convert format
+        dataset = standardize_sharegpt(dataset)
+        dataset = dataset.map(
+            alpaca_to_conversations,
+            batched=True,
+            remove_columns=["instruction", "input", "output"]
+        )
+        
+        # Apply chat template
+        dataset = dataset.map(
+            lambda examples: formatting_prompts_func(examples, tokenizer),
+            batched=True
+        )
+        
+        print(f"✓ Dataset prepared with {len(dataset)} examples")
+        print("="*70 + "\n")
+        
+        return dataset
+    except Exception as e:
+        print(f"❌ Error preparing dataset: {e}")
+        raise
 
 # ============================================================================
 # MODEL SETUP
@@ -185,17 +212,28 @@ def load_model():
     print(f"Max sequence length: {MAX_SEQ_LENGTH}")
     print(f"4-bit quantization: {LOAD_IN_4BIT}")
     
-    model, tokenizer = FastLanguageModel.from_pretrained(
-        model_name=MODEL_NAME,
-        max_seq_length=MAX_SEQ_LENGTH,
-        dtype=DTYPE,
-        load_in_4bit=LOAD_IN_4BIT,
-    )
-    
-    print("✓ Model loaded successfully!")
-    print("="*70 + "\n")
-    
-    return model, tokenizer
+    try:
+        from unsloth import FastLanguageModel
+        
+        model, tokenizer = FastLanguageModel.from_pretrained(
+            model_name=MODEL_NAME,
+            max_seq_length=MAX_SEQ_LENGTH,
+            dtype=DTYPE,
+            load_in_4bit=LOAD_IN_4BIT,
+            # Add these parameters for better Blackwell compatibility
+            trust_remote_code=True,
+            device_map="auto",
+        )
+        
+        print("✓ Model loaded successfully!")
+        print("="*70 + "\n")
+        
+        return model, tokenizer
+    except Exception as e:
+        print(f"❌ Error loading model: {e}")
+        print("\nIf you're seeing CUDA kernel errors, your PyTorch version")
+        print("may not support your GPU. See the instructions above.")
+        raise
 
 def add_lora_adapters(model):
     """Add LoRA adapters to the model"""
@@ -206,31 +244,44 @@ def add_lora_adapters(model):
     print(f"LoRA alpha: {LORA_ALPHA}")
     print(f"Target modules: {TARGET_MODULES}")
     
-    model = FastLanguageModel.get_peft_model(
-        model,
-        r=LORA_R,
-        target_modules=TARGET_MODULES,
-        lora_alpha=LORA_ALPHA,
-        lora_dropout=LORA_DROPOUT,
-        bias="none",
-        use_gradient_checkpointing="unsloth",
-        random_state=RANDOM_SEED,
-        use_rslora=False,
-        loftq_config=None,
-    )
-    
-    print("✓ LoRA adapters added successfully!")
-    print("="*70 + "\n")
-    
-    return model
+    try:
+        from unsloth import FastLanguageModel
+        
+        model = FastLanguageModel.get_peft_model(
+            model,
+            r=LORA_R,
+            target_modules=TARGET_MODULES,
+            lora_alpha=LORA_ALPHA,
+            lora_dropout=LORA_DROPOUT,
+            bias="none",
+            use_gradient_checkpointing="unsloth",
+            random_state=RANDOM_SEED,
+            use_rslora=False,
+            loftq_config=None,
+        )
+        
+        print("✓ LoRA adapters added successfully!")
+        print("="*70 + "\n")
+        
+        return model
+    except Exception as e:
+        print(f"❌ Error adding LoRA adapters: {e}")
+        raise
 
 def setup_tokenizer(tokenizer):
     """Setup chat template for tokenizer"""
-    tokenizer = get_chat_template(
-        tokenizer,
-        chat_template="qwen-2.5",
-    )
-    return tokenizer
+    try:
+        from unsloth.chat_templates import get_chat_template
+        
+        tokenizer = get_chat_template(
+            tokenizer,
+            chat_template="qwen-2.5",
+        )
+        return tokenizer
+    except Exception as e:
+        print(f"⚠️  Warning: Could not set chat template: {e}")
+        print("Continuing with default tokenizer...")
+        return tokenizer
 
 # ============================================================================
 # TRAINING
@@ -330,43 +381,49 @@ def test_model(model, tokenizer):
     print("TESTING MODEL")
     print("="*70)
     
-    # Enable fast inference
-    FastLanguageModel.for_inference(model)
-    
-    messages = [
-        {"role": "user", "content":
-         "You are an expert OpenCV code reviewer. Review this change:\n\n"
-         "File: modules/imgproc/src/resize.cpp\n"
-         "@@ -100,7 +100,7 @@\n"
-         " cv::Mat src, dst;\n"
-         "-cv::resize(src, dst, cv::Size(100,100));\n"
-         "+cv::resize(src, dst, cv::Size(100,100), CV_INTER_LINEAR);\n"}
-    ]
-    
-    inputs = tokenizer.apply_chat_template(
-        messages,
-        tokenize=True,
-        add_generation_prompt=True,
-        return_tensors="pt",
-    ).to("cuda")
-    
-    text_streamer = TextStreamer(tokenizer, skip_prompt=True)
-    
-    print("\nModel Response:")
-    print("-" * 70)
-    _ = model.generate(
-        input_ids=inputs,
-        streamer=text_streamer,
-        max_new_tokens=256,
-        use_cache=True,
-        temperature=0.3,  # Lower temperature for code accuracy
-        top_p=0.9,
-        do_sample=True,
-        repetition_penalty=1.1,
-        pad_token_id=tokenizer.eos_token_id,
-    )
-    print("-" * 70)
-    print("="*70 + "\n")
+    try:
+        from unsloth import FastLanguageModel
+        
+        # Enable fast inference
+        FastLanguageModel.for_inference(model)
+        
+        messages = [
+            {"role": "user", "content":
+             "You are an expert OpenCV code reviewer. Review this change:\n\n"
+             "File: modules/imgproc/src/resize.cpp\n"
+             "@@ -100,7 +100,7 @@\n"
+             " cv::Mat src, dst;\n"
+             "-cv::resize(src, dst, cv::Size(100,100));\n"
+             "+cv::resize(src, dst, cv::Size(100,100), CV_INTER_LINEAR);\n"}
+        ]
+        
+        inputs = tokenizer.apply_chat_template(
+            messages,
+            tokenize=True,
+            add_generation_prompt=True,
+            return_tensors="pt",
+        ).to("cuda")
+        
+        text_streamer = TextStreamer(tokenizer, skip_prompt=True)
+        
+        print("\nModel Response:")
+        print("-" * 70)
+        _ = model.generate(
+            input_ids=inputs,
+            streamer=text_streamer,
+            max_new_tokens=256,
+            use_cache=True,
+            temperature=0.3,  # Lower temperature for code accuracy
+            top_p=0.9,
+            do_sample=True,
+            repetition_penalty=1.1,
+            pad_token_id=tokenizer.eos_token_id,
+        )
+        print("-" * 70)
+        print("="*70 + "\n")
+    except Exception as e:
+        print(f"⚠️  Warning: Could not test model: {e}")
+        print("Continuing anyway...")
 
 # ============================================================================
 # MODEL SAVING
@@ -379,10 +436,24 @@ def save_model(model, tokenizer):
     print("="*70)
     print(f"Pushing to: {HF_REPO_NAME}")
     
-    model.push_to_hub(HF_REPO_NAME, token=HF_TOKEN)
-    tokenizer.push_to_hub(HF_REPO_NAME, token=HF_TOKEN)
+    if not HF_TOKEN:
+        print("⚠️  Warning: HF_TOKEN not found. Skipping upload to HuggingFace Hub.")
+        print("Set HF_TOKEN in your .env file to enable automatic upload.")
+    else:
+        try:
+            model.push_to_hub(HF_REPO_NAME, token=HF_TOKEN)
+            tokenizer.push_to_hub(HF_REPO_NAME, token=HF_TOKEN)
+            print("✓ Model saved successfully!")
+        except Exception as e:
+            print(f"❌ Error saving model: {e}")
+            print("Model training completed but upload failed.")
     
-    print("✓ Model saved successfully!")
+    # Save locally as backup
+    print("\nSaving model locally as backup...")
+    model.save_pretrained("./local_model")
+    tokenizer.save_pretrained("./local_model")
+    print("✓ Model saved locally to ./local_model")
+    
     print("="*70 + "\n")
 
 # ============================================================================
@@ -395,35 +466,44 @@ def main():
     print("OPENCV CODE REVIEWER TRAINING SCRIPT")
     print("="*70 + "\n")
     
-    # Setup
-    setup_environment()
-    check_gpu()
-    
-    # Load model
-    model, tokenizer = load_model()
-    tokenizer = setup_tokenizer(tokenizer)
-    
-    # Add LoRA adapters
-    model = add_lora_adapters(model)
-    
-    # Prepare dataset
-    dataset = prepare_dataset(tokenizer)
-    
-    # Create trainer
-    trainer = create_trainer(model, tokenizer, dataset)
-    
-    # Train
-    trainer_stats = train_model(trainer)
-    
-    # Test
-    test_model(model, tokenizer)
-    
-    # Save
-    save_model(model, tokenizer)
-    
-    print("\n" + "="*70)
-    print("ALL DONE!")
-    print("="*70 + "\n")
+    try:
+        # Setup
+        setup_environment()
+        
+        # Load model
+        model, tokenizer = load_model()
+        tokenizer = setup_tokenizer(tokenizer)
+        
+        # Add LoRA adapters
+        model = add_lora_adapters(model)
+        
+        # Prepare dataset
+        dataset = prepare_dataset(tokenizer)
+        
+        # Create trainer
+        trainer = create_trainer(model, tokenizer, dataset)
+        
+        # Train
+        trainer_stats = train_model(trainer)
+        
+        # Test
+        test_model(model, tokenizer)
+        
+        # Save
+        save_model(model, tokenizer)
+        
+        print("\n" + "="*70)
+        print("ALL DONE!")
+        print("="*70 + "\n")
+        
+    except KeyboardInterrupt:
+        print("\n\n⚠️  Training interrupted by user")
+        sys.exit(0)
+    except Exception as e:
+        print(f"\n\n❌ Fatal error: {e}")
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
 
 if __name__ == "__main__":
     main()

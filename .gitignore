@@ -3,3 +3,6 @@ unsloth_compiled_cache/
 .ipynb_checkpoints/
 outputs/
 .env
+nareshmlx
+local_model_lora/
+local_model_merged/

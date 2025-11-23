@@ -6,7 +6,7 @@ load_dotenv()  # Load environment variables from .env file
 
 # Load from your checkpoint
 model, tokenizer = FastLanguageModel.from_pretrained(
-    model_name="./outputs/checkpoint-643",
+    model_name="/workspace/opencv_code_review/outputs/checkpoint-1286",
     max_seq_length=16384,
     dtype=None,
     load_in_4bit=True,
